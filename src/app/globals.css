@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0f1714;
+  --foreground: #e8efe9;
+  --card: #15201b;
+  --card-foreground: #e8efe9;
+  --popover: #15201b;
+  --popover-foreground: #e8efe9;
+  --primary: #d2b56b;
+  --primary-foreground: #1a1510;
+  --secondary: #24332c;
+  --secondary-foreground: #d7e0d9;
+  --muted: #1c2822;
+  --muted-foreground: #9aaba1;
+  --accent: #2a3d34;
+  --accent-foreground: #e8efe9;
+  --destructive: #b54a3c;
+  --destructive-foreground: #fff5f2;
+  --border: #2f4339;
+  --input: #2f4339;
+  --ring: #d2b56b;
+  --waveform-panel: linear-gradient(160deg, #14201a 0%, #1a2a22 45%, #243028 100%);
+  --radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background:
+      radial-gradient(ellipse 90% 60% at 10% -10%, rgba(210, 181, 107, 0.14), transparent 55%),
+      radial-gradient(ellipse 70% 50% at 100% 0%, rgba(47, 110, 90, 0.22), transparent 50%),
+      linear-gradient(180deg, #101916 0%, #0c1210 55%, #0a100e 100%);
+    color: var(--foreground);
+    font-family: var(--font-body), "Noto Sans SC", sans-serif;
+    min-height: 100vh;
+  }
+
+  .font-display {
+    font-family: var(--font-display), "Noto Serif SC", serif;
+  }
+
+  .bg-waveform-panel {
+    background: var(--waveform-panel);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes zoom-in-95 {
+  from {
+    transform: scale(0.95);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+.animate-in {
+  animation: fade-in 0.35s ease both, zoom-in-95 0.35s ease both;
+}
