@@ -1,9 +1,14 @@
 import { embeddingSimilarity, type VoiceEmbedding } from "./features";
 import { averageVectors, clamp, l2Normalize } from "./math";
 
+export type VoiceTraits = {
+  sex: "男" | "女" | "未知";
+  ageBand: "大人" | "孩子" | "老人" | "未知";
+};
+
 export type SpeakerSeat =
-  | { kind: "me"; label: "你" }
-  | { kind: "other"; id: number; label: string };
+  | { kind: "me"; label: "你"; traits?: VoiceTraits }
+  | { kind: "other"; id: number; label: string; traits: VoiceTraits };
 
 export type RejectReason =
   | "silence"
@@ -12,7 +17,8 @@ export type RejectReason =
   | "not_speech"
   | "pitch_mismatch"
   | "below_threshold"
-  | "no_enrollment";
+  | "no_enrollment"
+  | "near_me_hold";
 
 export type ClusterDecision = {
   seat: SpeakerSeat | null;
@@ -25,6 +31,10 @@ export type ClusterDecision = {
 export type ClustererOptions = {
   meThreshold?: number;
   otherThreshold?: number;
+  /** Soft-me floor: meSim above this must not seed a new other seat. */
+  meProtectFloor?: number;
+  /** Other must beat meSim by this margin to steal the frame. */
+  otherWinMargin?: number;
   pitchRatioMin?: number;
   pitchRatioMax?: number;
   maxOthers?: number;
@@ -32,7 +42,7 @@ export type ClustererOptions = {
 
 const OTHER_LABELS = ["说话人甲", "说话人乙", "说话人丙", "说话人丁", "说话人戊", "说话人己"];
 
-function otherLabel(id: number): string {
+function otherBaseLabel(id: number): string {
   return OTHER_LABELS[id - 1] ?? `说话人${id}`;
 }
 
@@ -44,6 +54,7 @@ export const REJECT_LABELS: Record<RejectReason, string> = {
   pitch_mismatch: "音高不符（不像你）",
   below_threshold: "相似度不足",
   no_enrollment: "尚未录入声纹",
+  near_me_hold: "接近本人，暂不分给别人",
 };
 
 type OtherCentroid = {
@@ -51,18 +62,64 @@ type OtherCentroid = {
   vector: number[];
   pitchHz: number | null;
   count: number;
+  traits: VoiceTraits;
 };
 
 /**
+ * Pitch → rough sex / age band. Heuristic only; unknown is allowed.
+ * Child / adult / elder boundaries are coarse and must not override seating.
+ */
+export function inferVoiceTraits(pitchHz: number | null): VoiceTraits {
+  if (pitchHz == null || !Number.isFinite(pitchHz) || pitchHz <= 0) {
+    return { sex: "未知", ageBand: "未知" };
+  }
+  if (pitchHz >= 255) {
+    return { sex: "未知", ageBand: "孩子" };
+  }
+  if (pitchHz >= 175) {
+    return { sex: "女", ageBand: "大人" };
+  }
+  if (pitchHz >= 85) {
+    // Low adult male; very low may be elder-ish but keep adult unless extreme
+    if (pitchHz < 110) {
+      return { sex: "男", ageBand: "老人" };
+    }
+    return { sex: "男", ageBand: "大人" };
+  }
+  return { sex: "未知", ageBand: "未知" };
+}
+
+function formatOtherLabel(id: number, traits: VoiceTraits): string {
+  const base = otherBaseLabel(id);
+  const bits = [traits.sex, traits.ageBand].filter((x) => x !== "未知");
+  return bits.length ? `${base}·${bits.join("·")}` : base;
+}
+
+function pitchCompatible(
+  a: number | null,
+  b: number | null,
+  minRatio = 0.72,
+  maxRatio = 1.38,
+): boolean {
+  if (a == null || b == null || a <= 0 || b <= 0) return true;
+  const ratio = b / a;
+  return ratio >= minRatio && ratio <= maxRatio;
+}
+
+/**
  * Online speaker clustering with a dedicated "me" seat.
- * - meThreshold default 0.78
- * - otherThreshold default 0.7
- * - pitch ratio gate rejects "almost me" mismatches
- * - other people get separate 说话人甲/乙… seats
+ *
+ * Lever for the two deadlocks (AQ soft-me → 甲; multi-person merge/split):
+ * 1) Soft / falsetto "me" must stay "你": high meSim is not demoted by pitch alone;
+ *    a protect floor stops near-me frames from seeding 说话人甲.
+ * 2) Other seats need clear win over me + pitch compatibility so A/B don't merge
+ *    across large pitch gaps; seats carry sex/age traits for basic readout.
  */
 export class OnlineSpeakerClusterer {
   meThreshold: number;
   otherThreshold: number;
+  meProtectFloor: number;
+  otherWinMargin: number;
   pitchRatioMin: number;
   pitchRatioMax: number;
   maxOthers: number;
@@ -72,10 +129,14 @@ export class OnlineSpeakerClusterer {
   private meCount = 0;
   private others: OtherCentroid[] = [];
   private nextOtherId = 1;
+  private lastWasMe = false;
 
   constructor(options: ClustererOptions = {}) {
     this.meThreshold = options.meThreshold ?? 0.78;
     this.otherThreshold = options.otherThreshold ?? 0.7;
+    this.meProtectFloor =
+      options.meProtectFloor ?? clamp(this.meThreshold - 0.12, 0.5, this.meThreshold);
+    this.otherWinMargin = options.otherWinMargin ?? 0.05;
     this.pitchRatioMin = options.pitchRatioMin ?? 0.78;
     this.pitchRatioMax = options.pitchRatioMax ?? 1.28;
     this.maxOthers = options.maxOthers ?? 6;
@@ -93,6 +154,7 @@ export class OnlineSpeakerClusterer {
   clearOthers(): void {
     this.others = [];
     this.nextOtherId = 1;
+    this.lastWasMe = false;
   }
 
   reset(): void {
@@ -114,14 +176,25 @@ export class OnlineSpeakerClusterer {
     return this.others.map((o) => ({
       kind: "other" as const,
       id: o.id,
-      label: otherLabel(o.id),
+      label: formatOtherLabel(o.id, o.traits),
+      traits: o.traits,
     }));
   }
 
-  private pitchOk(pitchHz: number | null): boolean {
-    if (this.mePitchHz == null || pitchHz == null) return true;
-    const ratio = pitchHz / this.mePitchHz;
-    return ratio >= this.pitchRatioMin && ratio <= this.pitchRatioMax;
+  private acceptMe(embedding: VoiceEmbedding, meSim: number): ClusterDecision {
+    this.updateMe(embedding);
+    this.lastWasMe = true;
+    return {
+      seat: {
+        kind: "me",
+        label: "你",
+        traits: inferVoiceTraits(embedding.pitchHz ?? this.mePitchHz),
+      },
+      similarity: meSim,
+      rejectReason: null,
+      rejectLabel: null,
+      peopleEstimate: this.peopleEstimate,
+    };
   }
 
   assign(
@@ -146,92 +219,130 @@ export class OnlineSpeakerClusterer {
     }
 
     const meSim = embeddingSimilarity(embedding.vector, this.meCentroid);
+    const { bestIdx, bestSim } = this.bestOtherMatch(embedding);
 
+    // Strong me: trust embedding. Soft/falsetto must stay 「你」— do not demote on pitch alone.
     if (meSim >= this.meThreshold) {
-      if (!this.pitchOk(embedding.pitchHz)) {
-        // High embedding sim but pitch off → do not treat as 你
-        return this.assignOther(embedding, meSim, "pitch_mismatch");
+      return this.acceptMe(embedding, meSim);
+    }
+
+    // Soft-me protect band: near enrollment, do not seed 说话人甲 as "other me".
+    const protectFloor = this.lastWasMe
+      ? Math.max(this.meProtectFloor - 0.03, 0.5)
+      : this.meProtectFloor;
+
+    if (meSim >= protectFloor) {
+      const otherClearlyWins =
+        bestIdx >= 0 &&
+        bestSim >= this.otherThreshold &&
+        bestSim >= meSim + this.otherWinMargin &&
+        pitchCompatible(
+          embedding.pitchHz,
+          this.others[bestIdx]!.pitchHz,
+          0.78,
+          1.28,
+        );
+
+      if (otherClearlyWins) {
+        return this.commitOther(bestIdx, embedding, bestSim, null);
       }
-      this.updateMe(embedding);
-      return {
-        seat: { kind: "me", label: "你" },
-        similarity: meSim,
-        rejectReason: null,
-        rejectLabel: null,
-        peopleEstimate: this.peopleEstimate,
-      };
+
+      // Hold as 你 rather than invent a new other seat from soft/near-me speech.
+      return this.acceptMe(embedding, meSim);
     }
 
-    // Near-me but below threshold with bad pitch → explicit reject reason for UI list
-    if (meSim >= this.meThreshold - 0.08 && !this.pitchOk(embedding.pitchHz)) {
-      return this.assignOther(embedding, meSim, "pitch_mismatch");
-    }
-
-    return this.assignOther(embedding, meSim, meSim < this.otherThreshold ? "below_threshold" : null);
+    return this.assignOther(embedding, meSim, bestIdx, bestSim);
   }
 
-  private assignOther(
-    embedding: VoiceEmbedding,
-    meSim: number,
-    preferReject: RejectReason | null,
-  ): ClusterDecision {
+  private bestOtherMatch(embedding: VoiceEmbedding): { bestIdx: number; bestSim: number } {
     let bestIdx = -1;
     let bestSim = -1;
     for (let i = 0; i < this.others.length; i++) {
-      const sim = embeddingSimilarity(embedding.vector, this.others[i]!.vector);
+      const o = this.others[i]!;
+      if (!pitchCompatible(embedding.pitchHz, o.pitchHz)) {
+        continue;
+      }
+      const sim = embeddingSimilarity(embedding.vector, o.vector);
       if (sim > bestSim) {
         bestSim = sim;
         bestIdx = i;
       }
     }
+    return { bestIdx, bestSim };
+  }
 
-    if (bestIdx >= 0 && bestSim >= this.otherThreshold) {
-      this.updateOther(bestIdx, embedding);
-      const seat = this.others[bestIdx]!;
-      return {
-        seat: { kind: "other", id: seat.id, label: otherLabel(seat.id) },
-        similarity: bestSim,
-        rejectReason: preferReject === "pitch_mismatch" ? "pitch_mismatch" : null,
-        rejectLabel: preferReject === "pitch_mismatch" ? REJECT_LABELS.pitch_mismatch : null,
-        peopleEstimate: this.peopleEstimate,
-      };
+  private assignOther(
+    embedding: VoiceEmbedding,
+    meSim: number,
+    bestIdx: number,
+    bestSim: number,
+  ): ClusterDecision {
+    if (
+      bestIdx >= 0 &&
+      bestSim >= this.otherThreshold &&
+      bestSim >= meSim + this.otherWinMargin
+    ) {
+      return this.commitOther(bestIdx, embedding, bestSim, null);
+    }
+
+    // Never open a new other seat while still near me (belt-and-suspenders).
+    if (meSim >= this.meProtectFloor) {
+      return this.acceptMe(embedding, meSim);
     }
 
     if (this.others.length < this.maxOthers) {
       const id = this.nextOtherId++;
+      const traits = inferVoiceTraits(embedding.pitchHz);
       this.others.push({
         id,
         vector: embedding.vector.slice(),
         pitchHz: embedding.pitchHz,
         count: 1,
+        traits,
       });
+      this.lastWasMe = false;
       return {
-        seat: { kind: "other", id, label: otherLabel(id) },
+        seat: { kind: "other", id, label: formatOtherLabel(id, traits), traits },
         similarity: Math.max(bestSim, 0),
-        rejectReason: preferReject,
-        rejectLabel: preferReject ? REJECT_LABELS[preferReject] : null,
+        rejectReason: meSim < this.otherThreshold ? "below_threshold" : null,
+        rejectLabel: meSim < this.otherThreshold ? REJECT_LABELS.below_threshold : null,
         peopleEstimate: this.peopleEstimate,
       };
     }
 
-    // Cap reached — attach to nearest or reject
     if (bestIdx >= 0) {
-      this.updateOther(bestIdx, embedding);
-      const seat = this.others[bestIdx]!;
-      return {
-        seat: { kind: "other", id: seat.id, label: otherLabel(seat.id) },
-        similarity: bestSim,
-        rejectReason: preferReject ?? "below_threshold",
-        rejectLabel: REJECT_LABELS[preferReject ?? "below_threshold"],
-        peopleEstimate: this.peopleEstimate,
-      };
+      return this.commitOther(bestIdx, embedding, bestSim, "below_threshold");
     }
 
+    this.lastWasMe = false;
     return {
       seat: null,
       similarity: meSim,
-      rejectReason: preferReject ?? "below_threshold",
-      rejectLabel: REJECT_LABELS[preferReject ?? "below_threshold"],
+      rejectReason: "below_threshold",
+      rejectLabel: REJECT_LABELS.below_threshold,
+      peopleEstimate: this.peopleEstimate,
+    };
+  }
+
+  private commitOther(
+    index: number,
+    embedding: VoiceEmbedding,
+    sim: number,
+    preferReject: RejectReason | null,
+  ): ClusterDecision {
+    this.updateOther(index, embedding);
+    const seat = this.others[index]!;
+    this.lastWasMe = false;
+    return {
+      seat: {
+        kind: "other",
+        id: seat.id,
+        label: formatOtherLabel(seat.id, seat.traits),
+        traits: seat.traits,
+      },
+      similarity: sim,
+      rejectReason: preferReject,
+      rejectLabel: preferReject ? REJECT_LABELS[preferReject] : null,
       peopleEstimate: this.peopleEstimate,
     };
   }
@@ -259,6 +370,7 @@ export class OnlineSpeakerClusterer {
     if (embedding.pitchHz != null) {
       o.pitchHz =
         o.pitchHz == null ? embedding.pitchHz : (o.pitchHz * n + embedding.pitchHz) / (n + 1);
+      o.traits = inferVoiceTraits(o.pitchHz);
     }
   }
 
@@ -275,5 +387,6 @@ export class OnlineSpeakerClusterer {
   setThresholds(me: number, other: number): void {
     this.meThreshold = clamp(me, 0.5, 0.99);
     this.otherThreshold = clamp(other, 0.4, 0.95);
+    this.meProtectFloor = clamp(this.meThreshold - 0.12, 0.5, this.meThreshold);
   }
 }

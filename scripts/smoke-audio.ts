@@ -3,11 +3,12 @@
  * Run: npm run smoke
  */
 import assert from "node:assert/strict";
-import { OnlineSpeakerClusterer } from "../src/lib/audio/cluster";
+import { OnlineSpeakerClusterer, inferVoiceTraits } from "../src/lib/audio/cluster";
 import {
   SAMPLE_RATE,
   classifyAudio,
   extractEmbedding,
+  embeddingSimilarity,
   type VoiceEmbedding,
 } from "../src/lib/audio/features";
 import { fftReal, nextPow2, powerSpectrum } from "../src/lib/audio/fft";
@@ -115,17 +116,22 @@ console.log("听席 smoke-audio starting…");
   assert.equal(meDecision.seat?.label, "你");
   assert.ok(meDecision.similarity >= 0.78, `me sim ${meDecision.similarity}`);
 
-  // Different pitch speaker → other seat (说话人甲…)
-  const other = extractEmbedding(tone(230, 1.0, SAMPLE_RATE, 0.45));
-  assert.ok(other);
-  const otherDecision = clusterer.assign(other!, "speech");
-  assert.ok(
-    otherDecision.seat?.kind === "other" || otherDecision.rejectReason === "pitch_mismatch",
-    `expected other/pitch reject, got ${JSON.stringify(otherDecision)}`,
+  // Far embedding + different pitch → other seat (说话人甲…)
+  // Pure tones stay too close in Mel space; use an explicit distant vector.
+  const meVec = embeddings[0]!.vector;
+  const otherVec = l2Normalize(meVec.map((_, i) => (i % 3 === 0 ? 1 : i % 3 === 1 ? -0.7 : 0.2)));
+  assert.ok(embeddingSimilarity(otherVec, meVec) < 0.55, "fixture other must be far from me");
+  const otherDecision = clusterer.assign(
+    { vector: otherVec, pitchHz: 230, energyDb: -22 },
+    "speech",
   );
-  if (otherDecision.seat?.kind === "other") {
-    assert.match(otherDecision.seat.label, /^说话人/);
-  }
+  assert.equal(
+    otherDecision.seat?.kind,
+    "other",
+    `expected other seat, got ${JSON.stringify(otherDecision)}`,
+  );
+  assert.match(otherDecision.seat!.label, /^说话人/);
+  assert.ok(otherDecision.seat!.kind === "other" && otherDecision.seat.traits);
 
   // Noise gate before speaker ID
   const noiseDecision = clusterer.assign(
@@ -143,6 +149,81 @@ console.log("听席 smoke-audio starting…");
 
   console.log("✓ OnlineSpeakerClusterer me / other / reject gates");
   console.log(`  peopleEstimate=${clusterer.peopleEstimate}`);
+}
+
+// Deadlock regressions (aligned with grokbot-aimoyu PR#4 AQ soft-me → 甲)
+{
+  const meClips = [tone(145, 1.0), tone(148, 1.0), tone(142, 1.0)];
+  const embeddings: VoiceEmbedding[] = [];
+  for (const clip of meClips) {
+    const emb = extractEmbedding(clip);
+    assert.ok(emb);
+    embeddings.push(emb!);
+  }
+
+  const clusterer = new OnlineSpeakerClusterer({
+    meThreshold: 0.78,
+    otherThreshold: 0.7,
+    meProtectFloor: 0.66,
+  });
+  clusterer.enrollMe(embeddings);
+
+  // Soft / quieter same-timbre clip must stay 「你」, not seed 说话人甲
+  const softMe = extractEmbedding(tone(146, 1.0, SAMPLE_RATE, 0.18));
+  assert.ok(softMe);
+  const softDecision = clusterer.assign(softMe!, "speech");
+  assert.equal(
+    softDecision.seat?.kind,
+    "me",
+    `soft-me must stay 你, got ${JSON.stringify(softDecision)}`,
+  );
+  assert.equal(clusterer.getOtherSeats().length, 0, "soft-me must not seed other seats");
+
+  // Near-me synthetic embedding below hard threshold but above protect floor
+  const meCentroid = embeddings[0]!.vector;
+  const nearMe: VoiceEmbedding = {
+    vector: l2Normalize(meCentroid.map((v, i) => v * 0.92 + (i % 2 === 0 ? 0.08 : -0.05))),
+    pitchHz: 210, // falsetto-ish; must not demote solely on pitch
+    energyDb: -28,
+  };
+  const nearSim = embeddingSimilarity(nearMe.vector, meCentroid);
+  assert.ok(nearSim < 0.78 || nearSim >= 0.66, `fixture sim unexpected: ${nearSim}`);
+  const nearDecision = clusterer.assign(nearMe, "speech");
+  assert.equal(
+    nearDecision.seat?.kind,
+    "me",
+    `near-me/falsetto band must stay 你, got ${JSON.stringify(nearDecision)} sim=${nearDecision.similarity}`,
+  );
+
+  // Two others with far vectors + incompatible pitch must not merge
+  const femaleVec = l2Normalize(meCentroid.map((_, i) => (i % 2 === 0 ? 0.9 : -0.4)));
+  const maleVec = l2Normalize(meCentroid.map((_, i) => (i % 2 === 0 ? -0.85 : 0.55)));
+  assert.ok(embeddingSimilarity(femaleVec, meCentroid) < 0.6);
+  assert.ok(embeddingSimilarity(maleVec, meCentroid) < 0.6);
+  const fDec = clusterer.assign(
+    { vector: femaleVec, pitchHz: 220, energyDb: -22 },
+    "speech",
+  );
+  const mDec = clusterer.assign(
+    { vector: maleVec, pitchHz: 105, energyDb: -22 },
+    "speech",
+  );
+  assert.equal(fDec.seat?.kind, "other", JSON.stringify(fDec));
+  assert.equal(mDec.seat?.kind, "other", JSON.stringify(mDec));
+  assert.notEqual(
+    fDec.seat && fDec.seat.kind === "other" ? fDec.seat.id : -1,
+    mDec.seat && mDec.seat.kind === "other" ? mDec.seat.id : -2,
+    "male/female others must not share one seat",
+  );
+
+  const traitsChild = inferVoiceTraits(280);
+  assert.equal(traitsChild.ageBand, "孩子");
+  const traitsFemale = inferVoiceTraits(200);
+  assert.equal(traitsFemale.sex, "女");
+  const traitsMale = inferVoiceTraits(120);
+  assert.equal(traitsMale.sex, "男");
+
+  console.log("✓ soft-me protect + pitch-separated other seats + traits");
 }
 
 // Math helpers
